@@ -1638,6 +1638,57 @@ static inline bool project_to_screen(const vector3d &in, vector3d &out, const Gr
 	return true;
 }
 
+double WorldView::CalculateDistToStop( bool returnReverse = true )
+{
+	/*-- Distance to stop is initially calculated as a function of time spent accelerating:
+	-- DistanceToStop = ( Force / MassFlow ) * ln( Mass0 ) * TimeToStop 
+	--			+ ( Force / MassFlow ^ 2 ) * ( Mass0 - MassFlow * TimeToStop ) * ( ln( Mass0 - MassFlow * TimeToStop ) - 1 ) 
+	--			- ( Force * Mass0 / MassFlow ^ 2 ) * ( ln( Mass0 ) - 1 )
+	--
+	--	TimeToStop is a function of the current speed ( n.b. this only 
+	--	considers speed, not velocity.  Therefore, if your initial aim
+	--	is out, then even though the stopping distance is correct, the 
+	--	actual stop point will still be a few percent away from your 
+	--	intended destination.  An error of a few percent can still mean 
+	--	millions or tens of millions of kilometres.  Also, no consideration
+	--	is given to planetary gravitational effects ).
+	--
+	-- TimeToStop = ( 1 / MassFlow ) * ( Mass0 - SpeedFunction )
+	--
+	-- SpeedFunction = e ^ ( ( Force * ln( Mass0 ) - MassFlow * CurrentSpeed ) / Force )
+
+	-- Distance(t) = ( F / B ).ln( m0 ).t 
+	--		+ ( F / B^2 ).( m0 - Bt ).( ln( m0 - Bt ) - 1 ) 
+	--		- ( F.m0 / B^2 ).( ln( m0 ) - 1 )
+	
+	-- Current Mass = Hull + Cargo + Equipment + Fuel remaining
+	*/
+	double thrust, massFlow;
+	if ( returnReverse == false )
+	{
+		// Return calculations for forward (main) thrusters
+		thrust = Pi::player->GetShipType()->linThrust[ShipType::THRUSTER_FORWARD];
+	} else {
+		// Return calculations for reverse (retro) thrusters
+		thrust = Pi::player->GetShipType()->linThrust[ShipType::THRUSTER_REVERSE];
+	}
+	Body *navtarget = Pi::player->GetNavTarget();
+	double fuelMassLeft = Pi::player->GetFuel();
+	double exhaustV = Pi::player->GetShipType()->effectiveExhaustVelocity;
+	double allUpMass = Pi::player->GetMass() + fuelMassLeft;
+	vector3d navvelocity = -navtarget->GetVelocityRelTo(Pi::player);
+	double navspeed = navvelocity.Length();
+	massFlow = thrust / exhaustV;
+	double speedFunction = exp( ( thrust * log( allUpMass ) - massFlow * navspeed ) / thrust );
+	double timeToStop = ( 1 / massFlow ) * ( allUpMass - speedFunction );
+	double distToStop = ( thrust / massFlow ) * log( allUpMass ) * timeToStop;
+	distToStop += ( thrust / pow( massFlow, 2 ) ) * ( allUpMass - massFlow * timeToStop ) * ( log( allUpMass - massFlow * timeToStop ) - 1 );
+	distToStop -= ( thrust * allUpMass / pow( massFlow, 2 ) ) * ( log( allUpMass ) - 1 );
+	distToStop = fabs( distToStop );
+	return distToStop;
+}
+
+
 void WorldView::UpdateProjectedObjects()
 {
 	const int guiSize[2] = { Gui::Screen::GetWidth(), Gui::Screen::GetHeight() };
@@ -1742,12 +1793,79 @@ void WorldView::UpdateProjectedObjects()
 		double navspeed = navvelocity.Length();
 		const vector3d camSpaceNavVel = navvelocity * cam_rot;
 
+		
+		// Calculate distance to stop given relative speed to nav target
+		bool navCompEnhanced = true; // Placeholder to indicate Navigation Computer Enhancements have been purchased / installed
+		const double AUm = 149597871000;
+		double distToStopFwd, distToStopRev;
+		char bufFmtFwd[128];
+		char bufFmtRev[128];		
+		char bufFmt[128];
+		if ( navCompEnhanced == true ) {
+			distToStopFwd = CalculateDistToStop( false );
+			distToStopRev = CalculateDistToStop( true );
+			
+			if ( distToStopFwd > AUm/100 )
+			{
+				distToStopFwd = distToStopFwd / AUm;
+				strcpy( bufFmtFwd, "\nF %.2f AU" );
+				
+			} else if ( distToStopFwd > 1000000 )
+			{
+				distToStopFwd = distToStopFwd / 1000000;
+				strcpy( bufFmtFwd, "\nF %.2f Mm" );
+			} else if ( distToStopFwd > 1000 )
+			{
+				distToStopFwd = distToStopFwd / 1000;
+				strcpy( bufFmtFwd, "\nF %.2f km" );
+			} else
+			{
+				strcpy( bufFmtFwd, "\nF %.0f m" );
+			}
+			
+			if ( distToStopRev > AUm/100 )
+			{
+				distToStopRev = distToStopRev / AUm;
+				strcpy( bufFmtRev, "\nR %.2f AU" );
+			} else if ( distToStopRev > 1000000 )
+			{
+				distToStopRev = distToStopRev / 1000000;
+				strcpy( bufFmtRev, "\nR %.2f Mm" );
+			} else if ( distToStopRev > 1000 )
+			{
+				distToStopRev = distToStopRev / 1000;
+				strcpy( bufFmtRev, "\nR %.2f km" );
+			} else
+			{
+				strcpy( bufFmtRev, "\nR %.0f m" );
+			}
+			std::strcat( bufFmtFwd, bufFmtRev );
+		}
+		
 		if (navspeed >= 0.01) { // 1 cm per second
 			char buf[128];
-			if (navspeed > 1000)
-				snprintf(buf, sizeof(buf), "%.2f km/s", navspeed*0.001);
-			else
-				snprintf(buf, sizeof(buf), "%.0f m/s", navspeed);
+			if (navspeed > 1000) {
+				std::strcpy( bufFmt, "%.2f km/s" );
+				if ( navCompEnhanced == true ) {
+					double deltav = Pi::player->GetSpeedReachedWithFuel()/1000;
+					std::strcat( bufFmt, "\nD %.2f km/s" );
+					std::strcat( bufFmt, bufFmtFwd );
+					snprintf(buf, sizeof(buf), bufFmt, navspeed*0.001, deltav, distToStopFwd, distToStopRev );	//snprintf(buf, sizeof(buf), "%.2f km/s \nFwd: %.2f \nRet: %.2f", navspeed*0.001, distToStopFwd, distToStopRev );
+				} else {
+					snprintf( buf, sizeof( buf ), bufFmt, navspeed * 0.001 );
+				}
+			}
+			else {
+				std::strcpy( bufFmt, "%.0f m/s" );
+				if ( navCompEnhanced == true ) {
+					//double deltav = Pi::player->GetShipType()->GetSpeedReachedWithFuel;
+					//std::strcat( bufFmt, "\nD %.2f km/s" );
+					std::strcat( bufFmt, bufFmtFwd );				
+					snprintf(buf, sizeof(buf), bufFmt, navspeed, distToStopFwd, distToStopRev );		//snprintf(buf, sizeof(buf), "%.0f m/s \nFwd: %.2f \nRet: %.2f", navspeed, distToStopFwd, distToStopRev );
+				} else {
+					snprintf( buf, sizeof( buf ), bufFmt, navspeed );
+				}
+			}
 			m_navVelIndicator.label->SetText(buf);
 			UpdateIndicator(m_navVelIndicator, camSpaceNavVel);
 			UpdateIndicator(m_retroVelIndicator, -camSpaceNavVel);
